@@ -1,3 +1,4 @@
 models
+models_mnist
 emnist-letters-train.csv
 __pycache__

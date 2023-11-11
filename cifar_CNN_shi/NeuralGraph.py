@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 import networkx as nx
-from torch.utils.checkpoint import checkpoint
 
 class InputIntegrator(nn.Module):
     def __init__(self, ch_inp:int=8, ch_n:int=8, ch_n_const:int=0):
@@ -69,7 +68,7 @@ class Update(nn.Module):
             nn.SiLU(),
             nn.Linear(64, 32),
             nn.SiLU(),
-            nn.Linear(32, (ch_n - ch_n_const)),
+            nn.Linear(32, (ch_n-ch_n_const)),
         )
 
     def forward(self, x):
@@ -96,7 +95,7 @@ class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, ch_n_const=0, ch_e_const=0,
                  decay=0, leakage=0, clamp_mode="soft", max_value=1e6,
                  value_init="trainable", init_value_std=1, set_nodes=False, aggregation="attention", n_heads=1,
-                 use_label=False, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu", use_checkpoints=False, checkpoint_every = 1,
+                 use_label=False, node_dropout_p=0, edge_dropout_p=0, poolsize=None, device="cpu",
                  n_models=1, message_generator=Message, update_generator=Update, attention_generator=Attention, 
                  inp_int_generator=InputIntegrator, label_int_generator=LabelIntegrator,
                  out_int_generator=OutputInterpreter):
@@ -167,7 +166,7 @@ class NeuralGraph(nn.Module):
         self.value_init, self.set_nodes, self.aggregation, self.use_label = value_init, set_nodes, aggregation, use_label
         self.init_value_std, self.n_heads = init_value_std, n_heads
         self.node_dropout_p, self.edge_dropout_p, self.poolsize = node_dropout_p, edge_dropout_p, poolsize
-        self.device, self.use_checkpoints, self.checkpoint_every = device, use_checkpoints, checkpoint_every
+        self.device = device
         self.pool = None
 
         assert self.clamp_mode in ["soft", "hard", "none"], f"Unknown clamp_mode option {self.clamp_mode}"
@@ -538,15 +537,7 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps):
             if not apply_once:
                 self.apply_vals(x)
-            
-            if self.use_checkpoints and t % self.checkpoint_every == 0:
-                checkpoint(
-                    self.timestep,
-                    use_reentrant=False,
-                    step_nodes=nodes, step_edges=edges, dt=dt, t=t
-                )
-            else:
-                self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
+            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
         return self.read_outputs()
     
     def backward(self, x, y, time=5, dt=1, apply_once=False, nodes=True, edges=False, edges_at_end=True):
@@ -576,23 +567,8 @@ class NeuralGraph(nn.Module):
         for t in range(timesteps-1):
             if not apply_once:
                 self.apply_vals(x, label=y)
-            if self.use_checkpoints and t % self.checkpoint_every == 0:
-                checkpoint(
-                    self.timestep,
-                    use_reentrant=False,
-                    step_nodes=nodes, step_edges=edges, dt=dt, t=t
-                )
-            else:
-                self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
-
-        if self.use_checkpoints and t % self.checkpoint_every == 0:
-            checkpoint(
-                self.timestep,
-                use_reentrant=False,
-                step_nodes=nodes, step_edges=edges or edges_at_end, dt=dt, t=t
-            )
-        else:
-            self.timestep(step_nodes=nodes, step_edges=edges or edges_at_end, dt=dt, t=t)
+            self.timestep(step_nodes=nodes, step_edges=edges, dt=dt, t=t)
+        self.timestep(step_nodes=nodes, step_edges=edges or edges_at_end, dt=dt, t=t)
     
     def predict(self, X, time=5, dt=1, reset_nodes=False, **kwargs):
         """
