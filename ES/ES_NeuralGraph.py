@@ -65,7 +65,7 @@ class NeuralGraph(nn.Module):
         :param out_int_generator: Function to generate output interpreter.  Must have very
             specific shape of input_shape=(ch_n) and output_shape=(ch_out)
         """
-        super().__init__()
+        super(NeuralGraph, self).__init__()
         
         self.n_nodes, self.n_edges, self.connections = n_nodes, len(connections), connections
         self.n_inputs, self.n_outputs = n_inputs, n_outputs
@@ -91,19 +91,27 @@ class NeuralGraph(nn.Module):
         # Default message
         self.messages = messages or nn.ModuleList([ES_MLP(nn.Sequential(
             ES_Linear(ch_n*2+ch_e, 16),
-            nn.ReLU(),
+            nn.Tanh(),
             ES_Linear(16, 2*(ch_n-ch_n_const)+(ch_e-ch_e_const)),
         )) for _ in range(self.n_models)])
 
 
         self.updates = updates or nn.ModuleList([ES_MLP(nn.Sequential(
             ES_Linear(ch_n*3, 16),
-            nn.ReLU(),
+            nn.Tanh(),
             ES_Linear(16, ch_n-ch_n_const),
         )) for _ in range(self.n_models)])
         
-        self.inp_enc = inp_enc or ES_MLP(nn.Sequential(ES_Linear(ch_n+ch_inp, ch_n)))
-        self.out_dec = out_dec or ES_MLP(nn.Sequential(ES_Linear(ch_n, ch_out)))
+        self.inp_enc = inp_enc or ES_MLP(nn.Sequential(
+                ES_Linear(ch_n+ch_inp, 16),
+                nn.Tanh(),
+                ES_Linear(16, ch_n-ch_n_const),
+            ))
+        self.out_dec = out_dec or ES_MLP(nn.Sequential(
+                ES_Linear(ch_n, 16),
+                nn.Tanh(),
+                ES_Linear(16, ch_out),
+            ))
 
         self.ruleset = [self.messages, self.updates, self.inp_enc, self.out_dec]
 
@@ -116,14 +124,18 @@ class NeuralGraph(nn.Module):
 
             self.attentions = attentions or nn.ModuleList([ES_MLP(nn.Sequential(
                 ES_Linear(ch_n, 16),
-                nn.ReLU(),
+                nn.Tanh(),
                 ES_Linear(16, 4*ch_k),
             )) for _ in range(self.n_models)])
 
             self.ruleset.append(self.attentions)
         
         if self.use_label:
-            self.label_enc = label_enc or ES_MLP(nn.Sequential(ES_Linear(ch_n+ch_out, ch_n)))
+            self.label_enc = label_enc or ES_MLP(nn.Sequential(
+                ES_Linear(ch_n+ch_out, 16),
+                nn.Tanh(),
+                ES_Linear(16, ch_n-ch_n_const),
+            ))
 
             self.ruleset.append(self.label_enc)
 
@@ -143,6 +155,8 @@ class NeuralGraph(nn.Module):
 
         self.register_buffer("in_degs", in_degs)
         self.register_buffer("out_degs", out_degs)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     def set_const_vals(self, const_n=None, const_e=None):
         assert const_n is None or const_n.shape == (self.n_nodes, self.ch_n_const)
@@ -186,8 +200,8 @@ class NeuralGraph(nn.Module):
             f_ws = torch.exp(10*torch.tanh(f/10))
             b_ws = torch.exp(10*torch.tanh(b/10))
 
-            f_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads, device=self.device)
-            b_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads, device=self.device)
+            f_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads).to(self.device)
+            b_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads).to(self.device)
 
             f_w_agg.index_add_(1, self.targets, f_ws)
             b_w_agg.index_add_(1, self.sources, b_ws)
@@ -207,8 +221,8 @@ class NeuralGraph(nn.Module):
                 m_a = heads_a.reshape(*m_a.shape)
 
         # Aggregate messages
-        agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const)
-        agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const)
+        agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device)
+        agg_m_b = torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device)
         agg_m_a.index_add_(1, self.sources, m_a)
         agg_m_b.index_add_(1, self.targets, m_b)
 
@@ -257,9 +271,9 @@ class NeuralGraph(nn.Module):
             if self.init_mode == "trainable":
                 self.nodes = torch.cat([torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0), const_n], axis=2)
             elif self.init_mode == "random":
-                self.nodes = torch.cat([torch.randn(batch_size, self.n_nodes, self.ch_n-self.ch_n_const) * self.init_std, const_n], axis=2)
+                self.nodes = torch.cat([torch.randn(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device) * self.init_std, const_n], axis=2)
             elif self.init_mode == "zeros":
-                self.nodes = torch.cat([torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const), const_n], axis=2)
+                self.nodes = torch.cat([torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device), const_n], axis=2)
             else:
                 raise RuntimeError(f"Unknown initial value config {self.init_mode}")
             
@@ -268,9 +282,9 @@ class NeuralGraph(nn.Module):
             if self.init_mode == "trainable":
                 self.edges = torch.cat([torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0), const_e], axis=2)
             elif self.init_mode == "random":
-                self.edges = torch.cat([torch.randn(batch_size, self.n_edges, self.ch_e-self.ch_e_const) * self.init_std, const_e], axis=2)
+                self.edges = torch.cat([torch.randn(batch_size, self.n_edges, self.ch_e-self.ch_e_const).to(self.device) * self.init_std, const_e], axis=2)
             elif self.init_mode == "zeros":
-                self.edges = torch.cat([torch.zeros(batch_size, self.n_edges, self.ch_e-self.ch_e_const), const_e], axis=2)
+                self.edges = torch.cat([torch.zeros(batch_size, self.n_edges, self.ch_e-self.ch_e_const).to(self.device), const_e], axis=2)
             else:
                 raise RuntimeError(f"Unknown initial value config {self.init_mode}")
     
@@ -413,13 +427,13 @@ class NeuralGraph(nn.Module):
             self.forward(X[:, i], dt=dt, time=time, **kwargs)
             self.backward(X[:, i], Y[:, i], dt=dt, time=time, **kwargs)
 
-    def generate_epsilons(self, batch_size):
+    def generate_epsilons(self, batch_size, sigma=.1):
         for model in self.ruleset:
             if isinstance(model, nn.ModuleList):
                 for sub_model in model:
-                    sub_model.generate_epsilons(batch_size)
+                    sub_model.generate_epsilons(batch_size, sigma=sigma)
             else:
-                model.generate_epsilons(batch_size)
+                model.generate_epsilons(batch_size, sigma=sigma)
 
     def train_mode(self, flag):
         for model in self.ruleset:
@@ -429,10 +443,14 @@ class NeuralGraph(nn.Module):
             else:
                 model.train_mode(flag)
 
-    def estimate_grads(self, losses):
+    def estimate_grads(self, losses, sigma=.1):
         for model in self.ruleset:
             if isinstance(model, nn.ModuleList):
                 for sub_model in model:
-                    sub_model.estimate_grads(losses)
+                    sub_model.estimate_grads(losses, sigma=sigma)
             else:
-                model.estimate_grads(losses)
+                model.estimate_grads(losses, sigma=sigma)
+
+    def to(self, device):
+        self.device = device
+        return super(NeuralGraph, self).to(device)
