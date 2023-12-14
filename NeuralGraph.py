@@ -339,11 +339,11 @@ class NeuralGraph(nn.Module):
 
         if step_edges:
             if self.clamp_mode == "soft":
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = ((edges[:, :, :self.ch_e-self.ch_e_const] + m_ab)/self.max_value).tanh() * self.max_value
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = ((edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt)/self.max_value).tanh() * self.max_value
             if self.clamp_mode == "hard":
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = (edges[:, :, :self.ch_e-self.ch_e_const] + m_ab).clamp(-self.max_value, self.max_value)
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = (edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt).clamp(-self.max_value, self.max_value)
             else:
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = edges[:, :, :self.ch_e-self.ch_e_const] + m_ab
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt
 
     
     def init_vals(self, nodes=True, edges=True, batch_size=1):

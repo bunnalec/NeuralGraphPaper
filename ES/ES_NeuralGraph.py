@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
-from .ES_classes import ES_Linear, ES_MLP
+import sys
+sys.path.append("C:\\Users\\bunna\\Documents\\GitHub\\NeuralGraphPaper\\ES")
+from ES_classes import ES_Linear, ES_MLP, rank_normalize
 
 class NeuralGraph(nn.Module):
     def __init__(self, n_nodes, n_inputs, n_outputs, connections, ch_n=8, ch_e=8, ch_k=8, ch_inp=1, ch_out=1, ch_n_const=0, ch_e_const=0,
@@ -76,6 +78,8 @@ class NeuralGraph(nn.Module):
         self.init_mode, self.set_nodes, self.aggregation, self.use_label = init_mode, set_nodes, aggregation, use_label
         self.init_std, self.n_heads = init_std, n_heads
 
+        self.train_flag = True
+
         assert self.clamp_mode in ["soft", "hard", "none"], f"Unknown clamp_mode option {self.clamp_mode}"
         assert self.aggregation in ["attention", "sum", "mean"], f"Unknown aggregation option {self.aggregation}"
         assert self.init_mode in ["trainable", "random", "zeros"], f"Unknown initialization option {self.init_mode}"
@@ -91,25 +95,25 @@ class NeuralGraph(nn.Module):
         # Default message
         self.messages = messages or nn.ModuleList([ES_MLP(nn.Sequential(
             ES_Linear(ch_n*2+ch_e, 16),
-            nn.Tanh(),
+            nn.ReLU(),
             ES_Linear(16, 2*(ch_n-ch_n_const)+(ch_e-ch_e_const)),
         )) for _ in range(self.n_models)])
 
 
         self.updates = updates or nn.ModuleList([ES_MLP(nn.Sequential(
-            ES_Linear(ch_n*3, 16),
-            nn.Tanh(),
+            ES_Linear(ch_n*3-ch_n_const*2, 16),
+            nn.ReLU(),
             ES_Linear(16, ch_n-ch_n_const),
         )) for _ in range(self.n_models)])
         
         self.inp_enc = inp_enc or ES_MLP(nn.Sequential(
                 ES_Linear(ch_n+ch_inp, 16),
-                nn.Tanh(),
+                nn.ReLU(),
                 ES_Linear(16, ch_n-ch_n_const),
             ))
         self.out_dec = out_dec or ES_MLP(nn.Sequential(
                 ES_Linear(ch_n, 16),
-                nn.Tanh(),
+                nn.ReLU(),
                 ES_Linear(16, ch_out),
             ))
 
@@ -124,7 +128,7 @@ class NeuralGraph(nn.Module):
 
             self.attentions = attentions or nn.ModuleList([ES_MLP(nn.Sequential(
                 ES_Linear(ch_n, 16),
-                nn.Tanh(),
+                nn.ReLU(),
                 ES_Linear(16, 4*ch_k),
             )) for _ in range(self.n_models)])
 
@@ -133,20 +137,20 @@ class NeuralGraph(nn.Module):
         if self.use_label:
             self.label_enc = label_enc or ES_MLP(nn.Sequential(
                 ES_Linear(ch_n+ch_out, 16),
-                nn.Tanh(),
+                nn.ReLU(),
                 ES_Linear(16, ch_n-ch_n_const),
             ))
 
             self.ruleset.append(self.label_enc)
 
         self.register_buffer("const_n", torch.zeros(self.n_nodes, self.ch_n_const))
-        self.register_buffer("const_e", torch.zeros(self.n_edges, self.ch_n_const))
+        self.register_buffer("const_e", torch.zeros(self.n_edges, self.ch_e_const))
 
         self.register_buffer("sources", connections[:, 0].long())
         self.register_buffer("targets", connections[:, 1].long())
 
-        out_degs = torch.zeros(self.n_nodes).long()
-        in_degs = torch.zeros(self.n_nodes).long()
+        out_degs = torch.zeros(self.n_nodes).long().to(connections.device)
+        in_degs = torch.zeros(self.n_nodes).long().to(connections.device)
         out_degs.index_add_(0, *torch.unique(self.sources, return_counts=True))
         in_degs.index_add_(0, *torch.unique(self.targets, return_counts=True))
         # To avoid div by 0
@@ -188,37 +192,7 @@ class NeuralGraph(nn.Module):
         m_a, m_b, m_ab = torch.tensor_split(m, [self.ch_n-self.ch_n_const, (self.ch_n-self.ch_n_const)*2], 2)
         
         if self.aggregation == "attention":
-            attention = self.attentions[t % self.n_models](self.nodes)
-            attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
-            
-            f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
-            f = (f_keys[:, self.sources] * f_queries[:, self.targets]).sum(-1)
-            b = (b_queries[:, self.sources] * b_keys[:, self.targets]).sum(-1)
-
-            # Very hard to get max trick working with this implementation of softmax
-            # Therefore we will just do a soft clamp with tanh to ensure no value gets too big
-            f_ws = torch.exp(10*torch.tanh(f/10))
-            b_ws = torch.exp(10*torch.tanh(b/10))
-
-            f_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads).to(self.device)
-            b_w_agg = torch.zeros(batch_size, self.n_nodes, self.n_heads).to(self.device)
-
-            f_w_agg.index_add_(1, self.targets, f_ws)
-            b_w_agg.index_add_(1, self.sources, b_ws)
-
-            # batch, n_edges, n_heads
-            f_attention = f_ws / f_w_agg[:, self.targets]
-            b_attention = b_ws / b_w_agg[:, self.sources]
-
-            # -> batch, n_edges, ch_n
-            heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, (self.ch_n-self.ch_n_const)//self.n_heads) * torch.repeat_interleave(f_attention.unsqueeze(-1), (self.ch_n-self.ch_n_const)//self.n_heads, -1)
-            heads_a = m_a.reshape(*m_a.shape[:-1], self.n_heads, (self.ch_n-self.ch_n_const)//self.n_heads) * torch.repeat_interleave(b_attention.unsqueeze(-1), (self.ch_n-self.ch_n_const)//self.n_heads, -1)
-            if self.n_heads > 1:
-                m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
-                m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
-            else:
-                m_b = heads_b.reshape(*m_b.shape)
-                m_a = heads_a.reshape(*m_a.shape)
+            m_a, m_b = self.calc_attention(t)
 
         # Aggregate messages
         agg_m_a = torch.zeros(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device)
@@ -252,13 +226,48 @@ class NeuralGraph(nn.Module):
 
         if step_edges:
             if self.clamp_mode == "soft":
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = ((self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab)/self.max_value).tanh() * self.max_value
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = ((self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt)/self.max_value).tanh() * self.max_value
             if self.clamp_mode == "hard":
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = (self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab).clamp(-self.max_value, self.max_value)
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = (self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt).clamp(-self.max_value, self.max_value)
             else:
-                self.edges[:, :, :self.ch_e-self.ch_e_const] = self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab
+                self.edges[:, :, :self.ch_e-self.ch_e_const] = self.edges[:, :, :self.ch_e-self.ch_e_const] + m_ab*dt
 
-    
+    # Refactored this bc it clutters the timestep function and I don't usually have attention turned on anyway currently
+    def calc_attention(self, t):
+        attention = self.attentions[t % self.n_models](self.nodes)
+        attention = attention.reshape(*attention.shape[:-1], self.n_heads, (self.ch_k*4)//self.n_heads)
+        
+        f_keys, f_queries, b_keys, b_queries = torch.split(attention, [self.ch_k//self.n_heads,]*4, -1)
+        f = (f_keys[:, self.sources] * f_queries[:, self.targets]).sum(-1)
+        b = (b_queries[:, self.sources] * b_keys[:, self.targets]).sum(-1)
+
+        # Very hard to get max trick working with this implementation of softmax
+        # Therefore we will just do a soft clamp with tanh to ensure no value gets too big
+        f_ws = torch.exp(10*torch.tanh(f/10))
+        b_ws = torch.exp(10*torch.tanh(b/10))
+
+        f_w_agg = torch.zeros(self.nodes.shape[0], self.n_nodes, self.n_heads).to(self.device)
+        b_w_agg = torch.zeros(self.nodes.shape[0], self.n_nodes, self.n_heads).to(self.device)
+
+        f_w_agg.index_add_(1, self.targets, f_ws)
+        b_w_agg.index_add_(1, self.sources, b_ws)
+
+        # batch, n_edges, n_heads
+        f_attention = f_ws / f_w_agg[:, self.targets]
+        b_attention = b_ws / b_w_agg[:, self.sources]
+
+        # -> batch, n_edges, ch_n
+        heads_a = m_a.reshape(*m_a.shape[:-1], self.n_heads, (self.ch_n-self.ch_n_const)//self.n_heads) * torch.repeat_interleave(b_attention.unsqueeze(-1), (self.ch_n-self.ch_n_const)//self.n_heads, -1)
+        heads_b = m_b.reshape(*m_b.shape[:-1], self.n_heads, (self.ch_n-self.ch_n_const)//self.n_heads) * torch.repeat_interleave(f_attention.unsqueeze(-1), (self.ch_n-self.ch_n_const)//self.n_heads, -1)
+        if self.n_heads > 1:
+            m_a = self.multi_head_outa(heads_a.reshape(*m_a.shape))
+            m_b = self.multi_head_outb(heads_b.reshape(*m_b.shape))
+        else:
+            m_a = heads_a.reshape(*m_a.shape)
+            m_b = heads_b.reshape(*m_b.shape)
+
+        return m_a, m_b
+
     def init_vals(self, batch_size, nodes=True, edges=True):
         """
         Initialize nodes and edges.
@@ -269,7 +278,8 @@ class NeuralGraph(nn.Module):
         if nodes:
             const_n = torch.repeat_interleave(self.const_n.unsqueeze(0), batch_size, 0)
             if self.init_mode == "trainable":
-                self.nodes = torch.cat([torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0), const_n], axis=2)
+                self.nodes = torch.cat([torch.repeat_interleave((self.init_nodes).clone().unsqueeze(0), batch_size, 0) + \
+                                        (self.init_nodes_eps if self.train_flag else 0), const_n], axis=2)
             elif self.init_mode == "random":
                 self.nodes = torch.cat([torch.randn(batch_size, self.n_nodes, self.ch_n-self.ch_n_const).to(self.device) * self.init_std, const_n], axis=2)
             elif self.init_mode == "zeros":
@@ -280,7 +290,8 @@ class NeuralGraph(nn.Module):
         if edges:
             const_e = torch.repeat_interleave(self.const_e.unsqueeze(0), batch_size, 0)
             if self.init_mode == "trainable":
-                self.edges = torch.cat([torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0), const_e], axis=2)
+                self.edges = torch.cat([torch.repeat_interleave((self.init_edges).clone().unsqueeze(0), batch_size, 0) + \
+                                        (self.init_edges_eps if self.train_flag else 0), const_e], axis=2)
             elif self.init_mode == "random":
                 self.edges = torch.cat([torch.randn(batch_size, self.n_edges, self.ch_e-self.ch_e_const).to(self.device) * self.init_std, const_e], axis=2)
             elif self.init_mode == "zeros":
@@ -428,6 +439,13 @@ class NeuralGraph(nn.Module):
             self.backward(X[:, i], Y[:, i], dt=dt, time=time, **kwargs)
 
     def generate_epsilons(self, batch_size, sigma=.1):
+        if self.init_mode == "trainable":
+            init_nodes_eps = torch.randn(batch_size//2, *self.init_nodes.shape).to(self.device) * sigma
+            init_edges_eps = torch.randn(batch_size//2, *self.init_edges.shape).to(self.device) * sigma
+
+            self.init_nodes_eps = torch.cat([init_nodes_eps, -init_nodes_eps], axis=0)
+            self.init_edges_eps = torch.cat([init_edges_eps, -init_edges_eps], axis=0)
+
         for model in self.ruleset:
             if isinstance(model, nn.ModuleList):
                 for sub_model in model:
@@ -442,14 +460,24 @@ class NeuralGraph(nn.Module):
                     sub_model.train_mode(flag)
             else:
                 model.train_mode(flag)
+        
+        self.train_flag = flag
 
-    def estimate_grads(self, losses, sigma=.1):
+    def estimate_grads(self, losses, sigma=.1, normalize=False):
+        if normalize:
+            losses = rank_normalize(losses)
+        
+        if self.init_mode == "trainable":
+            # Estimate gradients
+            self.init_nodes.grad = (self.init_nodes_eps * losses.reshape(-1, 1, 1)).mean(0) / sigma**2
+            self.init_edges.grad = (self.init_edges_eps * losses.reshape(-1, 1, 1)).mean(0) / sigma**2
+
         for model in self.ruleset:
             if isinstance(model, nn.ModuleList):
                 for sub_model in model:
-                    sub_model.estimate_grads(losses, sigma=sigma)
+                    sub_model.estimate_grads(losses, sigma=sigma, normalize=normalize)
             else:
-                model.estimate_grads(losses, sigma=sigma)
+                model.estimate_grads(losses, sigma=sigma, normalize=normalize)
 
     def to(self, device):
         self.device = device

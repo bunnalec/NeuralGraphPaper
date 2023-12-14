@@ -70,7 +70,7 @@ class CartPole:
 
         # I will do something a bit different.
         # -1 everytime you fail and never "done" per say
-        reward = -self.done
+        reward = -self.done * 50 # Multiplying by 50 so approx. reward per step for doing nothing is -1
         if torch.any(self.done):
             self.reset(torch.argwhere(self.done == 1)[:, 0])
 

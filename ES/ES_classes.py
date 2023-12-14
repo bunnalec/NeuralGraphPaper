@@ -45,42 +45,37 @@ class ES_Linear(nn.Linear):
         if self.train_mode:
             assert hasattr(self, "epsilon_w"), "Never initialized epsilons but being used in train mode."
             assert x.shape[0] == self.epsilon_w.shape[0], f"Batch size was different than epsilon batch size: x shape was {x.shape} and epsilon shape was {self.epsilon_w.shape}"
-            # Factoring:
-            # x @ (w.T + ep1) + (b + ep2)
-            # To:
-            # x @ w.T + x @ ep1 + b + ep2
-            # So I don't have to repeat weight which is sorta wack
-            # if x.dim() == self.epsilon_w.dim():
-            #     noise_w = x @ torch.swapaxes(self.epsilon_w, -1, -2)
-            # elif x.dim() == self.epsilon_w.dim() - 1:
-            #     noise_w = (x.unsqueeze(-2) @ torch.swapaxes(self.epsilon_w, -1, -2)).squeeze(-2)
-            # else:
-            #     raise Exception("Not implemented more than 2 batch dims")
-            # b = self.bias + self.epsilon_b.reshape(self.epsilon_b.shape[0], *((x.dim()-2)*[1]), self.epsilon_b.shape[-1]) if self.bias is not None else 0
-            # out = x @ self.weight.T + noise_w + b
-            # return out
+            assert x.dim() >= 2, "Need at least 2 dimensions on input (batch, inps)"
+            og_shape = x.shape
 
-            # Honestly, I really just want to make sure I didn't fuck up here so reverting to repeating the weight (plus I just precompute the addition so its fineeeee).
             # In case there's extra batch dims (which there are in NeuralGraphs):
-            extra_batch_dims = (x.dim()-2)
-            # Reshaping for extra batch dims
-            # Had to take this w line out.  Could break it for diff dims of input????
-            # w = self.new_w.reshape(self.new_w.shape[0], *(1 for _ in range(extra_batch_dims)), *self.new_w.shape[1:])
-            b = self.new_b.reshape(self.new_b.shape[0], *(1 for _ in range(extra_batch_dims)), *self.new_b.shape[1:]) if self.bias is not None else 0
+            # Need to check if x dim or w dim is bigger
+            if x.dim() == 2:
+                x = x.reshape(x.shape[0], 1, x.shape[1])
+                w = self.new_w
+            else:
+                w = self.new_w.reshape(self.new_w.shape[0], *(1 for _ in range(x.dim() - 3)), *self.new_w.shape[1:])
+            
+            # This one always works
+            b = self.new_b.reshape(self.new_b.shape[0], *(1 for _ in range(x.dim() - 2)), *self.new_b.shape[1:]) if self.bias is not None else 0
+            
             # Honestly no idea why torch insists on having weight transposed like this
-            return x @ torch.swapaxes(self.new_w, -1, -2) + b
+            out = x @ torch.swapaxes(w, -1, -2) + b
+            out = out.reshape(*og_shape[:-1], w.shape[-2])
+            return out
         else:
             b = self.bias if self.bias is not None else 0
             return x @ self.weight.T + b
 
-    def estimate_grads(self, losses, sigma=.1):
+    def estimate_grads(self, losses, sigma=.1, normalize=False):
         # Just found out that they rank normalize.  Gonna try it
-        ranks = rank_normalize(losses)
+        if normalize:
+            losses = rank_normalize(losses)
 
         # Estimate gradients
-        self.weight.grad = (self.epsilon_w * ranks.reshape(-1, 1, 1)).mean(0) / sigma**2
+        self.weight.grad = (self.epsilon_w * losses.reshape(-1, 1, 1)).mean(0) / sigma**2
         if self.bias is not None:
-            self.bias.grad = (self.epsilon_b * ranks.reshape(-1, 1)).mean(0) / sigma**2
+            self.bias.grad = (self.epsilon_b * losses.reshape(-1, 1)).mean(0) / sigma**2
 
 
 class ES_MLP(nn.Module):
@@ -104,7 +99,7 @@ class ES_MLP(nn.Module):
         with torch.no_grad():
             return self.sequential(x)
         
-    def estimate_grads(self, losses, sigma=.1):
+    def estimate_grads(self, losses, sigma=.1, normalize=False):
         for layer in self.sequential:
             if hasattr(layer, "estimate_grads"):
-                layer.estimate_grads(losses, sigma=sigma)
+                layer.estimate_grads(losses, sigma=sigma, normalize=normalize)

@@ -39,9 +39,8 @@ while True:
     if keys[pygame.K_RETURN]:
         env.reset(torch.Tensor([0]).long())
     
-    reward, done = env.step(action)
+    reward = env.step(action)
     reward = reward.item()
-    done = done.item()
 
     regret -= reward
 
@@ -54,7 +53,7 @@ while True:
 
     x *= scale
 
-    print(f"Reward:{reward} | Regret:{regret} | done:{done} | x:{x} | theta:{theta}", end="\r")
+    print(f"Reward:{reward} | Regret:{regret} | x:{x} | theta:{theta}", end="\r")
 
     screen.fill((255, 255, 255))
 
